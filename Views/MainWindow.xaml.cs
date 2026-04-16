@@ -12,7 +12,7 @@ namespace SmartFarmUI.Views
 
             var settingsRepo = new SettingsRepository();
             var logService = new LogService();
-            var plcService = new PlcService(logService);
+            var plcService = new PlcService();
             var flaskApi = new FlaskApiService();
 
             DataContext = new MainWindowViewModel(plcService, flaskApi, logService, settingsRepo);

@@ -10,11 +10,11 @@ namespace SmartFarmUI.Services
         public event Action<DigitalInputData> DigitalInputReceived;
         public event Action<string> ConnectionError;
 
-        private TcAdsClient adsClient;
-        private int adsAnalogHandle = -1;
-        private int adsDigitalInputHandle = -1;
-        private int adsDigitalOutputHandle = -1;
-        private int[] adsLampHandles = new int[5];
+        private AdsClient adsClient;
+        private uint adsAnalogHandle = 0;
+        private uint adsDigitalInputHandle = 0;
+        private uint adsDigitalOutputHandle = 0;
+        private uint[] adsLampHandles = new uint[5];
         private System.Threading.Timer adsPollTimer;
         private readonly object adsLock = new object();
         private bool adsConnected = false;
@@ -27,7 +27,7 @@ namespace SmartFarmUI.Services
 
             try
             {
-                adsClient = new TcAdsClient();
+                adsClient = new AdsClient();
                 adsClient.Connect(SensorConstants.AdsPort);
                 adsAnalogHandle = adsClient.CreateVariableHandle(SensorConstants.AnalogInputSymbol);
 
@@ -44,7 +44,7 @@ namespace SmartFarmUI.Services
                     catch (Exception ex)
                     {
                         if (symbol == inputSymbols[inputSymbols.Length - 1])
-                            log?.Invoke($"⚠️ 디지털 입력 핸들 생성 실패: {ex.Message} (버튼 기능 비활성화)");
+                            log?.Invoke($"디지털 입력 핸들 생성 실패: {ex.Message} (버튼 기능 비활성화)");
                     }
                 }
 
@@ -75,7 +75,7 @@ namespace SmartFarmUI.Services
                     catch (Exception ex)
                     {
                         if (symbol == outputSymbols[outputSymbols.Length - 1])
-                            log?.Invoke($"⚠️ 디지털 출력 핸들 생성 실패: {ex.Message} (램프 기능 비활성화)");
+                            log?.Invoke($"디지털 출력 핸들 생성 실패: {ex.Message} (램프 기능 비활성화)");
                     }
                 }
 
@@ -103,27 +103,27 @@ namespace SmartFarmUI.Services
                 {
                     try
                     {
-                        if (adsAnalogHandle != -1)
+                        if (adsAnalogHandle != 0)
                         {
                             adsClient.DeleteVariableHandle(adsAnalogHandle);
-                            adsAnalogHandle = -1;
+                            adsAnalogHandle = 0;
                         }
-                        if (adsDigitalInputHandle != -1)
+                        if (adsDigitalInputHandle != 0)
                         {
                             adsClient.DeleteVariableHandle(adsDigitalInputHandle);
-                            adsDigitalInputHandle = -1;
+                            adsDigitalInputHandle = 0;
                         }
-                        if (adsDigitalOutputHandle != -1)
+                        if (adsDigitalOutputHandle != 0)
                         {
                             adsClient.DeleteVariableHandle(adsDigitalOutputHandle);
-                            adsDigitalOutputHandle = -1;
+                            adsDigitalOutputHandle = 0;
                         }
                         for (int i = 1; i <= 4; i++)
                         {
-                            if (adsLampHandles[i] != -1)
+                            if (adsLampHandles[i] != 0)
                             {
                                 try { adsClient.DeleteVariableHandle(adsLampHandles[i]); } catch { }
-                                adsLampHandles[i] = -1;
+                                adsLampHandles[i] = 0;
                             }
                         }
                         adsClient.Dispose();
@@ -146,7 +146,7 @@ namespace SmartFarmUI.Services
         {
             lock (adsLock)
             {
-                if (adsClient == null || !adsConnected || adsDigitalOutputHandle == -1)
+                if (adsClient == null || !adsConnected || adsDigitalOutputHandle == 0)
                     return;
 
                 adsClient.WriteAny(adsDigitalOutputHandle, output);
@@ -175,19 +175,19 @@ namespace SmartFarmUI.Services
         {
             lock (adsLock)
             {
-                if (adsClient == null || !adsConnected || adsAnalogHandle == -1)
+                if (adsClient == null || !adsConnected || adsAnalogHandle == 0)
                     return;
 
                 try
                 {
-                    var analogData = (AnalogInputData)adsClient.ReadAny(adsAnalogHandle, typeof(AnalogInputData));
+                    var analogData = adsClient.ReadAny<AnalogInputData>(adsAnalogHandle);
                     AnalogDataReceived?.Invoke(analogData);
 
-                    if (adsDigitalInputHandle != -1)
+                    if (adsDigitalInputHandle != 0)
                     {
                         try
                         {
-                            var digitalInput = (DigitalInputData)adsClient.ReadAny(adsDigitalInputHandle, typeof(DigitalInputData));
+                            var digitalInput = adsClient.ReadAny<DigitalInputData>(adsDigitalInputHandle);
                             DigitalInputReceived?.Invoke(digitalInput);
                         }
                         catch { }

@@ -46,15 +46,15 @@ namespace SmartFarmUI.ViewModels
             AllLogsView = CollectionViewSource.GetDefaultView(AllEntries);
 
             var errorSrc = new CollectionViewSource { Source = AllEntries };
-            errorSrc.Filter += (s, e) => e.Item is string entry && IsError(entry);
+            errorSrc.Filter += (s, e) => { e.Accepted = e.Item is string entry && IsError(entry); };
             ErrorLogsView = errorSrc.View;
 
             var warnSrc = new CollectionViewSource { Source = AllEntries };
-            warnSrc.Filter += (s, e) => e.Item is string entry && IsWarning(entry);
+            warnSrc.Filter += (s, e) => { e.Accepted = e.Item is string entry && IsWarning(entry); };
             WarningLogsView = warnSrc.View;
 
             var infoSrc = new CollectionViewSource { Source = AllEntries };
-            infoSrc.Filter += (s, e) => e.Item is string entry && !IsError(entry) && !IsWarning(entry);
+            infoSrc.Filter += (s, e) => { e.Accepted = e.Item is string entry && !IsError(entry) && !IsWarning(entry); };
             InfoLogsView = infoSrc.View;
 
             SaveLogsCommand = new RelayCommand(ExecuteSave);
