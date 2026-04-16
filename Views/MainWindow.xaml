@@ -60,7 +60,7 @@
             <StatusBarItem>
                 <StackPanel Orientation="Horizontal">
                     <TextBlock Text="PLC: " Foreground="Gray"/>
-                    <TextBlock Text="{Binding AdsConnected, StringFormat={}'{0}'}"
+                    <TextBlock Text="{Binding AdsConnected}"
                                Foreground="{Binding AdsConnected, Converter={StaticResource BoolToBrushConverter}}"/>
                 </StackPanel>
             </StatusBarItem>
