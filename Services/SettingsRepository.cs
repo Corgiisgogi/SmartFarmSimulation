@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
-using System.Windows.Forms;
 using SmartFarmUI.Models;
 
 namespace SmartFarmUI.Services
@@ -15,8 +14,8 @@ namespace SmartFarmUI.Services
 
         public SettingsRepository()
         {
-            settingsFilePath = Path.Combine(Application.StartupPath, "sensor_thresholds.txt");
-            farmInfoFilePath = Path.Combine(Application.StartupPath, "farm_info.txt");
+            settingsFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "sensor_thresholds.txt");
+            farmInfoFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "farm_info.txt");
         }
 
         public void SaveThresholds(Dictionary<int, SensorThreshold[]> farmSettings)

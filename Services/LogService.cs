@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Windows.Forms;
 using SmartFarmUI.Models;
 
 namespace SmartFarmUI.Services
@@ -114,7 +113,7 @@ namespace SmartFarmUI.Services
 
                 if (string.IsNullOrEmpty(filePath))
                 {
-                    string defaultDir = Path.Combine(Application.StartupPath, "Logs");
+                    string defaultDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Logs");
                     if (!Directory.Exists(defaultDir))
                         Directory.CreateDirectory(defaultDir);
                     filePath = Path.Combine(defaultDir, $"SmartFarm_Logs_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
