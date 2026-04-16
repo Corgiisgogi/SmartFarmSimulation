@@ -54,6 +54,22 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="Models\SensorThreshold.cs" />
+    <Compile Include="Models\SensorData.cs" />
+    <Compile Include="Models\PlcDataStructs.cs" />
+    <Compile Include="Models\SensorConstants.cs" />
+    <Compile Include="Models\FarmState.cs" />
+    <Compile Include="Services\JsonHelper.cs" />
+    <Compile Include="Services\ILogService.cs" />
+    <Compile Include="Services\LogService.cs" />
+    <Compile Include="Services\ISettingsRepository.cs" />
+    <Compile Include="Services\SettingsRepository.cs" />
+    <Compile Include="Services\SensorCalibration.cs" />
+    <Compile Include="Services\IFlaskApiService.cs" />
+    <Compile Include="Services\FlaskApiService.cs" />
+    <Compile Include="Services\IPlcService.cs" />
+    <Compile Include="Services\PlcService.cs" />
+    <Compile Include="Controllers\FarmController.cs" />
     <Compile Include="AddCropForm.cs">
       <SubType>Form</SubType>
     </Compile>

@@ -12,6 +12,9 @@ using System.Net;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using TwinCAT.Ads;
+using SmartFarmUI.Models;
+using SmartFarmUI.Services;
+using SmartFarmUI.Controllers;
 
 namespace SmartFarmUI
 {
@@ -19,24 +22,21 @@ namespace SmartFarmUI
     {
         private const int SensorCount = 4;
 
-        private class SensorThreshold
-        {
-            public int Min { get; set; }
-            public int Max { get; set; }
-        }
+        // SensorThreshold moved to Models/SensorThreshold.cs
 
         private bool powerOn = false;
         private bool ethercatPowerOn = false;
         private int currentFarm = 1;
-        private readonly List<string> logHistory = new List<string>();
+        private readonly ILogService logService = new LogService();
+        private readonly ISettingsRepository settingsRepo = new SettingsRepository();
+        private readonly IFlaskApiService flaskApi = new FlaskApiService();
+        private readonly IPlcService plcService = new PlcService();
         private LogForm logForm;
         private readonly Dictionary<int, SensorThreshold[]> farmSettings = new Dictionary<int, SensorThreshold[]>();
         private readonly Dictionary<int, string> farmCropNames = new Dictionary<int, string>();
         private readonly Dictionary<int, string> farmNotes = new Dictionary<int, string>();
         
-        // 설정 파일 경로
-        private readonly string settingsFilePath = Path.Combine(Application.StartupPath, "sensor_thresholds.txt");
-        private readonly string farmInfoFilePath = Path.Combine(Application.StartupPath, "farm_info.txt");
+        // 설정 파일 경로는 SettingsRepository로 이동
 
         private readonly string[] sensorDisplayNames = { "", "습도", "온도", "채광", "토양습도" };
         private readonly int[] sensorAlertStates = new int[SensorCount + 1];
@@ -60,19 +60,13 @@ namespace SmartFarmUI
         private readonly TimeSpan aiAutoControlCheckInterval = TimeSpan.FromSeconds(3); // 3초마다 체크 및 제어
         private readonly TimeSpan aiAutoControlExecutionCooldown = TimeSpan.FromSeconds(3); // 3초 쿨다운 (빠른 반응성)
         
-        // Flask 웹 서버 관련
-        private bool flaskServerRunning = false;
+        // Flask 웹 서버 관련 - flaskServerRunning은 flaskApi.IsConnected로 위임
+        private bool flaskServerRunning { get => flaskApi.IsConnected; }
         private const string FlaskServerUrl = "http://localhost:5000";
         private readonly object sensorDataLock = new object();
         private SensorData currentSensorData = new SensorData();
 
-        private TcAdsClient adsClient;
-        private int adsAnalogHandle = -1;
-        private int adsDigitalInputHandle = -1;
-        private int adsDigitalOutputHandle = -1;
-        private int[] adsLampHandles = new int[5]; // Lamp1~4 + 인덱스 0은 사용 안 함
-        private System.Threading.Timer adsPollTimer;
-        private readonly object adsLock = new object();
+        // PLC 필드는 PlcService로 이동. adsConnected는 UI 상태 동기화용으로 유지
         private bool adsConnected = false;
         
         // 정기 센서 데이터 로깅용 Timer (웹 표준 형식)
@@ -83,16 +77,13 @@ namespace SmartFarmUI
         // 압력 센서 디버깅 로그용 (주기적으로만 출력)
         private DateTime lastPressureLogTime = DateTime.MinValue;
         
-        private const int AdsPort = 851;
-        private const string AnalogInputSymbol = "GVL.NX_AD4203";
-        private const string DigitalInputSymbol = "GVL.NX_ID5342";
-        private const string DigitalOutputSymbol = "GVL.NX_OD5121";
+        // ADS 상수는 SensorConstants로 이동
         
         // 버튼 엣지 감지를 위한 이전 상태 (초기값은 모두 false)
         private bool[] previousButtonStates = new bool[5]; // Button1~4 + 인덱스 0은 사용 안 함
         private bool buttonStatesInitialized = false; // 버튼 상태 초기화 플래그
 
-        private enum EthercatConnectionStatus { Off, Connecting, Connected, Error }
+        // EthercatConnectionStatus moved to Models/PlcDataStructs.cs
         private EthercatConnectionStatus ethercatStatus = EthercatConnectionStatus.Off;
 
         public Form1()
@@ -103,7 +94,22 @@ namespace SmartFarmUI
             UpdateFarmButtonStyles();
             SetEthercatStatus(EthercatConnectionStatus.Off);
             SetOperationalControlsEnabled(false);
-            
+
+            // LogService 이벤트 구독
+            logService.LogEntryAdded += OnLogEntryAdded;
+
+            // PlcService 이벤트 구독
+            plcService.AnalogDataReceived += (data) => BeginInvoke(new Action(() => UpdateSensorsFromPlc(data)));
+            plcService.DigitalInputReceived += (data) => BeginInvoke(new Action(() => HandleDigitalInput(data)));
+            plcService.ConnectionError += (msg) => BeginInvoke(new Action(() =>
+            {
+                Log($"PLC 데이터 읽기 실패: {msg}");
+                MessageBox.Show($"PLC 데이터 읽기 실패: {msg}", "PLC 오류", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                DisconnectFromPlc(false);
+                ethercatPowerOn = false;
+                SetEthercatStatus(EthercatConnectionStatus.Error);
+            }));
+
             // Flask 서버 연결은 별도 스레드에서 확인
             Task.Run(() => CheckFlaskServerConnection());
             
@@ -420,103 +426,17 @@ namespace SmartFarmUI
         
         private List<string> GetCropListFromFlask()
         {
-            try
-            {
-                var request = (HttpWebRequest)WebRequest.Create($"{FlaskServerUrl}/api/crops");
-                request.Method = "GET";
-                request.Timeout = 3000;
-                
-                using (var response = (HttpWebResponse)request.GetResponse())
-                {
-                    if (response.StatusCode == HttpStatusCode.OK)
-                    {
-                        using (var stream = response.GetResponseStream())
-                        using (var reader = new System.IO.StreamReader(stream))
-                        {
-                            string jsonResponse = reader.ReadToEnd();
-                            var result = Newtonsoft.Json.JsonConvert.DeserializeObject<Dictionary<string, object>>(jsonResponse);
-                            
-                            if (result != null && result.ContainsKey("crops"))
-                            {
-                                var crops = Newtonsoft.Json.Linq.JArray.FromObject(result["crops"]);
-                                var cropList = new List<string>();
-                                
-                                foreach (var crop in crops)
-                                {
-                                    var cropObj = Newtonsoft.Json.Linq.JObject.FromObject(crop);
-                                    string cropName = cropObj["name"]?.ToString();
-                                    if (!string.IsNullOrEmpty(cropName))
-                                    {
-                                        cropList.Add(cropName);
-                                    }
-                                }
-                                
-                                return cropList;
-                            }
-                        }
-                    }
-                }
-            }
-            catch
-            {
-                // 연결 실패 시 기본 목록 반환
-            }
-            
-            // 기본 작물 목록 반환
-            return new List<string>
-            {
-                "사과", "토마토", "상추", "딸기", "오이", "고추", "배추",
-                "시금치", "파프리카", "가지", "무", "브로콜리"
-            };
+            return flaskApi.GetCropList();
         }
         
         private async Task<Dictionary<string, object>> GetCropInfoFromFlask(string cropName)
         {
             try
             {
-                // URL 인코딩 (한글 작물 이름 처리)
-                string encodedCropName = Uri.EscapeDataString(cropName);
-                HttpWebRequest request = (HttpWebRequest)WebRequest.Create($"{FlaskServerUrl}/api/crops/{encodedCropName}");
-                request.Method = "GET";
-                request.Timeout = 5000;
-                request.ContentType = "application/json";
-                
-                using (var response = (HttpWebResponse)await Task.Factory.FromAsync(
-                    request.BeginGetResponse, request.EndGetResponse, null))
-                {
-                    using (var stream = response.GetResponseStream())
-                    using (var reader = new System.IO.StreamReader(stream))
-                    {
-                        string jsonResponse = await reader.ReadToEndAsync();
-                        var result = Newtonsoft.Json.JsonConvert.DeserializeObject<Dictionary<string, object>>(jsonResponse);
-                        
-                        // HTTP 상태 코드가 404이거나 success가 false인 경우
-                        if (response.StatusCode == HttpStatusCode.NotFound || 
-                            (result != null && result.ContainsKey("success") && !(bool)result["success"]))
-                        {
-                            Log($"⚠️ Flask 서버에서 작물 '{cropName}' 정보를 찾을 수 없습니다.");
-                            if (result != null && result.ContainsKey("error"))
-                            {
-                                Log($"   오류: {result["error"]}");
-                            }
-                            return result; // null이 아닌 응답 객체 반환 (에러 정보 포함)
-                        }
-                        
-                        // 성공 응답
-                        if (response.StatusCode == HttpStatusCode.OK)
-                        {
-                            return result;
-                        }
-                        
-                        // 기타 상태 코드
-                        Log($"⚠️ Flask 서버 응답 오류: HTTP {response.StatusCode}");
-                        return result;
-                    }
-                }
+                return await flaskApi.GetCropInfoAsync(cropName);
             }
             catch (WebException webEx)
             {
-                // HTTP 에러 응답도 읽기
                 if (webEx.Response is HttpWebResponse httpResponse)
                 {
                     try
@@ -534,221 +454,34 @@ namespace SmartFarmUI
                             return errorResult;
                         }
                     }
-                    catch
-                    {
-                        // 에러 응답을 읽을 수 없는 경우
-                    }
+                    catch { }
                 }
                 Log($"⚠️ Flask 서버 연결 오류: {webEx.Message}");
-                System.Diagnostics.Debug.WriteLine($"작물 정보 가져오기 오류: {webEx.Message}");
             }
             catch (Exception ex)
             {
                 Log($"⚠️ 작물 정보 가져오기 오류: {ex.Message}");
-                System.Diagnostics.Debug.WriteLine($"작물 정보 가져오기 오류: {ex.Message}");
             }
             return null;
         }
         
         private string GenerateCropDetailedInfo(string cropName, Dictionary<string, object> cropInfo)
         {
-            try
-            {
-                var conditions = Newtonsoft.Json.Linq.JObject.FromObject(cropInfo["conditions"]);
-                string description = cropInfo.ContainsKey("description") ? cropInfo["description"]?.ToString() ?? "" : "";
-                string baseProduction = cropInfo.ContainsKey("base_production") ? cropInfo["base_production"]?.ToString() ?? "0" : "0";
-                
-                var info = new System.Text.StringBuilder();
-                info.AppendLine($"【 {cropName} 재배 최적 환경 】");
-                info.AppendLine();
-                
-                if (!string.IsNullOrEmpty(description))
-                {
-                    info.AppendLine(description);
-                    info.AppendLine();
-                }
-                
-                // 습도 정보
-                if (conditions["humidity"] != null)
-                {
-                    var humidity = conditions["humidity"];
-                    int optimalMin = humidity["optimal_min"]?.Value<int>() ?? 0;
-                    int optimalMax = humidity["optimal_max"]?.Value<int>() ?? 0;
-                    int acceptableMin = humidity["acceptable_min"]?.Value<int>() ?? 0;
-                    int acceptableMax = humidity["acceptable_max"]?.Value<int>() ?? 0;
-                    info.AppendLine($"• 습도: {acceptableMin}-{acceptableMax}% (생육기 최적 범위: {optimalMin}-{optimalMax}%)");
-                    if (acceptableMin < 40) info.AppendLine($"  - {acceptableMin}% 이하: 수분 부족, 생육 저하");
-                    if (acceptableMax > 80) info.AppendLine($"  - {acceptableMax}% 이상: 병해 발생 위험 증가");
-                    info.AppendLine();
-                }
-                
-                // 온도 정보
-                if (conditions["temperature"] != null)
-                {
-                    var temperature = conditions["temperature"];
-                    int optimalMin = temperature["optimal_min"]?.Value<int>() ?? 0;
-                    int optimalMax = temperature["optimal_max"]?.Value<int>() ?? 0;
-                    int acceptableMin = temperature["acceptable_min"]?.Value<int>() ?? 0;
-                    int acceptableMax = temperature["acceptable_max"]?.Value<int>() ?? 0;
-                    info.AppendLine($"• 온도: {acceptableMin}-{acceptableMax}℃ (생육기 최적 범위: {optimalMin}-{optimalMax}℃)");
-                    if (acceptableMin < 10) info.AppendLine($"  - {acceptableMin}℃ 이하: 생장 정지, 동해 발생 가능");
-                    if (acceptableMax > 30) info.AppendLine($"  - {acceptableMax}℃ 이상: 생육 저하, 열 스트레스");
-                    info.AppendLine();
-                }
-                
-                // 채광 정보
-                if (conditions["light"] != null)
-                {
-                    var light = conditions["light"];
-                    int optimalMin = light["optimal_min"]?.Value<int>() ?? 0;
-                    int optimalMax = light["optimal_max"]?.Value<int>() ?? 0;
-                    int acceptableMin = light["acceptable_min"]?.Value<int>() ?? 0;
-                    int acceptableMax = light["acceptable_max"]?.Value<int>() ?? 0;
-                    info.AppendLine($"• 채광: {acceptableMin}-{acceptableMax}% (생육기 최적 범위: {optimalMin}-{optimalMax}%)");
-                    info.AppendLine($"  - 광합성 활성화, 생육 촉진");
-                    if (acceptableMin < 50) info.AppendLine($"  - {acceptableMin}% 이하: 생육 저하, 잎이 연해짐");
-                    info.AppendLine();
-                }
-                
-                // 토양습도 정보
-                if (conditions["soil_moisture"] != null)
-                {
-                    var soilMoisture = conditions["soil_moisture"];
-                    int optimalMin = soilMoisture["optimal_min"]?.Value<int>() ?? 0;
-                    int optimalMax = soilMoisture["optimal_max"]?.Value<int>() ?? 0;
-                    int acceptableMin = soilMoisture["acceptable_min"]?.Value<int>() ?? 0;
-                    int acceptableMax = soilMoisture["acceptable_max"]?.Value<int>() ?? 0;
-                    info.AppendLine($"• 토양습도: {acceptableMin}-{acceptableMax}% (생육기 최적 범위: {optimalMin}-{optimalMax}%)");
-                    if (acceptableMin < 30) info.AppendLine($"  - {acceptableMin}% 이하: 뿌리 수분 흡수 어려움, 시들음");
-                    if (acceptableMax > 70) info.AppendLine($"  - {acceptableMax}% 이상: 뿌리 부패 위험");
-                    info.AppendLine();
-                }
-                
-                // 생산량 정보
-                if (double.TryParse(baseProduction, out double production) && production > 0)
-                {
-                    info.AppendLine($"• 예상 생산량: 식물당 약 {production}kg");
-                    info.AppendLine();
-                }
-                
-                info.AppendLine("※ 위 환경 조건을 유지하면 품질과 수확량이 향상됩니다.");
-                
-                return info.ToString();
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"⚠️ 작물 상세 정보 생성 오류: {ex.Message}");
-                return cropInfo.ContainsKey("description") ? cropInfo["description"]?.ToString() ?? "" : $"【 {cropName} 재배 】";
-            }
+            return FarmController.GenerateCropDetailedInfo(cropName, cropInfo);
         }
         
         private void ApplyCropConditions(int farmId, Dictionary<string, object> cropInfo)
         {
             try
             {
-                if (!cropInfo.ContainsKey("conditions"))
-                    return;
-                
-                var conditions = Newtonsoft.Json.Linq.JObject.FromObject(cropInfo["conditions"]);
-                
-                // 센서 임계값 설정 (acceptable_min ~ acceptable_max 범위 사용)
-                var thresholds = new SensorThreshold[SensorCount];
-                
-                // 습도 (인덱스 0)
-                if (conditions["humidity"] != null)
-                {
-                    var humidity = conditions["humidity"];
-                    thresholds[0] = new SensorThreshold
-                    {
-                        Min = humidity["acceptable_min"]?.Value<int>() ?? 30,
-                        Max = humidity["acceptable_max"]?.Value<int>() ?? 80
-                    };
-                    System.Diagnostics.Debug.WriteLine($"✅ 습도 임계값 설정: {thresholds[0].Min}-{thresholds[0].Max}%");
-                }
-                else
-                {
-                    thresholds[0] = new SensorThreshold { Min = 30, Max = 80 };
-                    System.Diagnostics.Debug.WriteLine($"⚠️ 습도 조건 없음, 기본값 사용: {thresholds[0].Min}-{thresholds[0].Max}%");
-                }
-                
-                // 온도 (인덱스 1)
-                if (conditions["temperature"] != null)
-                {
-                    var temperature = conditions["temperature"];
-                    thresholds[1] = new SensorThreshold
-                    {
-                        Min = temperature["acceptable_min"]?.Value<int>() ?? 0,
-                        Max = temperature["acceptable_max"]?.Value<int>() ?? 35
-                    };
-                    System.Diagnostics.Debug.WriteLine($"✅ 온도 임계값 설정: {thresholds[1].Min}-{thresholds[1].Max}℃");
-                }
-                else
-                {
-                    thresholds[1] = new SensorThreshold { Min = 0, Max = 35 };
-                    System.Diagnostics.Debug.WriteLine($"⚠️ 온도 조건 없음, 기본값 사용: {thresholds[1].Min}-{thresholds[1].Max}℃");
-                }
-                
-                // 채광 (인덱스 2) - 실제로는 인덱스 3 (센서 3)
-                if (conditions["light"] != null)
-                {
-                    var light = conditions["light"];
-                    thresholds[2] = new SensorThreshold
-                    {
-                        Min = light["acceptable_min"]?.Value<int>() ?? 50,
-                        Max = light["acceptable_max"]?.Value<int>() ?? 80
-                    };
-                    System.Diagnostics.Debug.WriteLine($"✅ 채광 임계값 설정: {thresholds[2].Min}-{thresholds[2].Max}%");
-                }
-                else
-                {
-                    thresholds[2] = new SensorThreshold { Min = 50, Max = 80 };
-                    System.Diagnostics.Debug.WriteLine($"⚠️ 채광 조건 없음, 기본값 사용: {thresholds[2].Min}-{thresholds[2].Max}%");
-                }
-                
-                // 토양습도 (인덱스 3) - 실제로는 인덱스 4 (센서 4)
-                if (conditions["soil_moisture"] != null)
-                {
-                    var soilMoisture = conditions["soil_moisture"];
-                    thresholds[3] = new SensorThreshold
-                    {
-                        Min = soilMoisture["acceptable_min"]?.Value<int>() ?? 20,
-                        Max = soilMoisture["acceptable_max"]?.Value<int>() ?? 60
-                    };
-                    System.Diagnostics.Debug.WriteLine($"✅ 토양습도 임계값 설정: {thresholds[3].Min}-{thresholds[3].Max}%");
-                }
-                else
-                {
-                    thresholds[3] = new SensorThreshold { Min = 20, Max = 60 };
-                    System.Diagnostics.Debug.WriteLine($"⚠️ 토양습도 조건 없음, 기본값 사용: {thresholds[3].Min}-{thresholds[3].Max}%");
-                }
-                
-                // farmSettings에 저장
+                var thresholds = FarmController.ParseCropThresholds(cropInfo);
+                if (thresholds == null) return;
+
                 farmSettings[farmId] = thresholds;
-                
-                // 센서 임계값 저장
                 SaveSensorThresholds();
-                
-                // UI 스레드에서 실행되도록 보장하고 항상 UI 업데이트
-                // (현재 선택된 농장이 아니어도 설정은 저장됨)
-                if (InvokeRequired)
+
+                Action updateUI = () =>
                 {
-                    BeginInvoke(new Action(() =>
-                    {
-                        // 현재 선택된 농장이면 즉시 UI 업데이트
-                        if (currentFarm == farmId)
-                        {
-                            ApplyFarmSettingsToUI(farmId);
-                            Log($"✅ 스마트팜 {farmId}의 TrackBar가 업데이트되었습니다.");
-                        }
-                        else
-                        {
-                            Log($"ℹ️ 스마트팜 {farmId}의 설정이 저장되었습니다. (현재 선택: 스마트팜 {currentFarm})");
-                        }
-                    }));
-                }
-                else
-                {
-                    // 현재 선택된 농장이면 즉시 UI 업데이트
                     if (currentFarm == farmId)
                     {
                         ApplyFarmSettingsToUI(farmId);
@@ -758,8 +491,13 @@ namespace SmartFarmUI
                     {
                         Log($"ℹ️ 스마트팜 {farmId}의 설정이 저장되었습니다. (현재 선택: 스마트팜 {currentFarm})");
                     }
-                }
-                
+                };
+
+                if (InvokeRequired)
+                    BeginInvoke(updateUI);
+                else
+                    updateUI();
+
                 Log($"   습도: {thresholds[0].Min}-{thresholds[0].Max}%, " +
                     $"온도: {thresholds[1].Min}-{thresholds[1].Max}℃, " +
                     $"채광: {thresholds[2].Min}-{thresholds[2].Max}%, " +
@@ -775,30 +513,10 @@ namespace SmartFarmUI
         {
             try
             {
-                HttpWebRequest request = (HttpWebRequest)WebRequest.Create($"{FlaskServerUrl}/api/ai/control");
-                request.Method = "POST";
-                request.ContentType = "application/json";
-                request.Timeout = 10000; // 10초 타임아웃
-                
-                byte[] data = Encoding.UTF8.GetBytes(jsonData);
-                request.ContentLength = data.Length;
-                
-                using (Stream requestStream = await request.GetRequestStreamAsync())
-                {
-                    await requestStream.WriteAsync(data, 0, data.Length);
-                }
-                
-                using (WebResponse response = await request.GetResponseAsync())
-                {
-                    using (StreamReader reader = new StreamReader(response.GetResponseStream()))
-                    {
-                        return await reader.ReadToEndAsync();
-                    }
-                }
+                return await flaskApi.RequestAIControlAsync(jsonData);
             }
             catch (WebException webEx)
             {
-                // HTTP 에러 응답 읽기
                 string errorMessage = webEx.Message;
                 if (webEx.Response is HttpWebResponse httpResponse)
                 {
@@ -812,9 +530,7 @@ namespace SmartFarmUI
                             {
                                 var errorObj = JObject.Parse(errorResponse);
                                 if (errorObj["error"] != null)
-                                {
                                     errorMessage = errorObj["error"].Value<string>();
-                                }
                             }
                             catch
                             {
@@ -827,21 +543,13 @@ namespace SmartFarmUI
                         errorMessage = $"HTTP {httpResponse.StatusCode}";
                     }
                 }
-                
-                // UI 스레드로 전환하여 로그 출력
-                BeginInvoke(new Action(() =>
-                {
-                    Log($"⚠️ AI 제어 요청 오류: {errorMessage}");
-                }));
+
+                BeginInvoke(new Action(() => Log($"⚠️ AI 제어 요청 오류: {errorMessage}")));
                 return null;
             }
             catch (Exception ex)
             {
-                // UI 스레드로 전환하여 로그 출력
-                BeginInvoke(new Action(() =>
-                {
-                    Log($"⚠️ AI 제어 요청 오류: {ex.Message}");
-                }));
+                BeginInvoke(new Action(() => Log($"⚠️ AI 제어 요청 오류: {ex.Message}")));
                 return null;
             }
         }
@@ -1263,22 +971,7 @@ namespace SmartFarmUI
         {
             try
             {
-                var lines = new List<string>();
-                
-                foreach (var farm in farmSettings.Keys.OrderBy(f => f))
-                {
-                    if (farmSettings.TryGetValue(farm, out var thresholds))
-                    {
-                        var thresholdValues = new List<string>();
-                        for (int i = 0; i < thresholds.Length; i++)
-                        {
-                            thresholdValues.Add($"S{i + 1}Min={thresholds[i].Min},S{i + 1}Max={thresholds[i].Max}");
-                        }
-                        lines.Add($"Farm{farm}:{string.Join(";", thresholdValues)}");
-                    }
-                }
-                
-                File.WriteAllLines(settingsFilePath, lines, Encoding.UTF8);
+                settingsRepo.SaveThresholds(farmSettings);
             }
             catch (Exception ex)
             {
@@ -1286,69 +979,19 @@ namespace SmartFarmUI
             }
         }
         
-        // 센서 임계값 불러오기
         private void LoadSensorThresholds()
         {
             try
             {
-                if (!File.Exists(settingsFilePath))
+                var loaded = settingsRepo.LoadThresholds();
+                foreach (var kvp in loaded)
                 {
-                    // 파일이 없으면 기본값 사용
-                    return;
+                    farmSettings[kvp.Key] = kvp.Value;
+                    if (kvp.Key == currentFarm)
+                        ApplyFarmSettingsToUI(kvp.Key);
                 }
-                
-                var lines = File.ReadAllLines(settingsFilePath, Encoding.UTF8);
-                
-                foreach (var line in lines)
-                {
-                    if (string.IsNullOrWhiteSpace(line) || !line.Contains(":"))
-                        continue;
-                    
-                    var parts = line.Split(new[] { ':' }, 2);
-                    if (parts.Length != 2)
-                        continue;
-                    
-                    // Farm 번호 추출
-                    if (!parts[0].StartsWith("Farm") || !int.TryParse(parts[0].Substring(4), out int farmId))
-                        continue;
-                    
-                    // 센서 임계값 파싱
-                    var sensorValues = parts[1].Split(';');
-                    var thresholds = new SensorThreshold[SensorCount];
-                    
-                    for (int i = 0; i < SensorCount && i < sensorValues.Length; i++)
-                    {
-                        var sensorData = sensorValues[i];
-                        int min = 0, max = 100;
-                        
-                        // S1Min=30,S1Max=70 형식 파싱
-                        var pairs = sensorData.Split(',');
-                        foreach (var pair in pairs)
-                        {
-                            var kv = pair.Split('=');
-                            if (kv.Length == 2)
-                            {
-                                if (kv[0].EndsWith("Min") && int.TryParse(kv[1], out int minVal))
-                                    min = minVal;
-                                else if (kv[0].EndsWith("Max") && int.TryParse(kv[1], out int maxVal))
-                                    max = maxVal;
-                            }
-                        }
-                        
-                        thresholds[i] = new SensorThreshold { Min = min, Max = max };
-                    }
-                    
-                    // farmSettings에 저장
-                    farmSettings[farmId] = thresholds;
-                    
-                    // 현재 팜이면 UI에 적용
-                    if (farmId == currentFarm)
-                    {
-                        ApplyFarmSettingsToUI(farmId);
-                    }
-                }
-                
-                Log("✅ 저장된 센서 임계값 불러오기 완료");
+                if (loaded.Count > 0)
+                    Log("✅ 저장된 센서 임계값 불러오기 완료");
             }
             catch (Exception ex)
             {
@@ -1356,25 +999,11 @@ namespace SmartFarmUI
             }
         }
         
-        // 스마트팜 정보 저장
         private void SaveFarmInfo()
         {
             try
             {
-                var lines = new List<string>();
-                
-                foreach (var farm in farmCropNames.Keys.Union(farmNotes.Keys).OrderBy(f => f))
-                {
-                    string cropName = farmCropNames.ContainsKey(farm) ? farmCropNames[farm] : "";
-                    string note = farmNotes.ContainsKey(farm) ? farmNotes[farm] : "";
-                    
-                    // 줄바꿈 문자를 특수 문자로 변환 (저장 시)
-                    string encodedNote = note.Replace("\r\n", "\\n").Replace("\n", "\\n").Replace("\r", "\\n");
-                    
-                    lines.Add($"Farm{farm}:Crop={cropName};Note={encodedNote}");
-                }
-                
-                File.WriteAllLines(farmInfoFilePath, lines, Encoding.UTF8);
+                settingsRepo.SaveFarmInfo(farmCropNames, farmNotes);
             }
             catch (Exception ex)
             {
@@ -1382,62 +1011,11 @@ namespace SmartFarmUI
             }
         }
         
-        // 스마트팜 정보 불러오기
         private void LoadFarmInfo()
         {
             try
             {
-                if (!File.Exists(farmInfoFilePath))
-                {
-                    // 파일이 없으면 기본값 사용
-                    return;
-                }
-                
-                var lines = File.ReadAllLines(farmInfoFilePath, Encoding.UTF8);
-                
-                foreach (var line in lines)
-                {
-                    if (string.IsNullOrWhiteSpace(line) || !line.Contains(":"))
-                        continue;
-                    
-                    var parts = line.Split(new[] { ':' }, 2);
-                    if (parts.Length != 2)
-                        continue;
-                    
-                    // Farm 번호 추출
-                    if (!parts[0].StartsWith("Farm") || !int.TryParse(parts[0].Substring(4), out int farmId))
-                        continue;
-                    
-                    // 정보 파싱 (Crop=작물명;Note=추가정보 형식)
-                    var infoParts = parts[1].Split(';');
-                    string cropName = "";
-                    string note = "";
-                    
-                    foreach (var infoPart in infoParts)
-                    {
-                        if (infoPart.StartsWith("Crop="))
-                        {
-                            cropName = infoPart.Substring(5);
-                        }
-                        else if (infoPart.StartsWith("Note="))
-                        {
-                            note = infoPart.Substring(5);
-                            // 특수 문자를 줄바꿈으로 복원
-                            note = note.Replace("\\n", Environment.NewLine);
-                        }
-                    }
-                    
-                    if (!string.IsNullOrEmpty(cropName))
-                    {
-                        farmCropNames[farmId] = cropName;
-                    }
-                    
-                    if (!string.IsNullOrEmpty(note))
-                    {
-                        farmNotes[farmId] = note;
-                    }
-                }
-                
+                settingsRepo.LoadFarmInfo(farmCropNames, farmNotes);
                 Log("✅ 저장된 스마트팜 정보 불러오기 완료");
             }
             catch (Exception ex)
@@ -1446,20 +1024,7 @@ namespace SmartFarmUI
             }
         }
         
-        // 센서 데이터 저장용 클래스
-        private class SensorData
-        {
-            public double Humidity { get; set; }
-            public double Temperature { get; set; }
-            public double Light { get; set; }
-            public double SoilMoisture { get; set; }
-            public DateTime LastUpdate { get; set; }
-            // 원본 센서 값 (오프셋 적용 전)
-            public double RawHumidity { get; set; }
-            public double RawTemperature { get; set; }
-            public double RawLight { get; set; }
-            public double RawSoilMoisture { get; set; }
-        }
+        // SensorData moved to Models/SensorData.cs
 
         private void InitializeSensorUI()
         {
@@ -1850,35 +1415,11 @@ namespace SmartFarmUI
         private void SendFarmChangeToFlask()
         {
             if (!flaskServerRunning) return;
-            
+
             Task.Run(() =>
             {
-                try
-                {
-                    string farmInfoJson = GetSensorDataJson(); // 농장 정보 포함 JSON 생성
-                    
-                    var request = (HttpWebRequest)WebRequest.Create($"{FlaskServerUrl}/api/sensor-data");
-                    request.Timeout = 2000; // 2초 타임아웃
-                    request.Method = "POST";
-                    request.ContentType = "application/json";
-                    
-                    byte[] dataBytes = Encoding.UTF8.GetBytes(farmInfoJson);
-                    request.ContentLength = dataBytes.Length;
-                    
-                    using (var requestStream = request.GetRequestStream())
-                    {
-                        requestStream.Write(dataBytes, 0, dataBytes.Length);
-                    }
-                    
-                    using (var response = (HttpWebResponse)request.GetResponse())
-                    {
-                        // 농장 정보 전송 완료
-                    }
-                }
-                catch
-                {
-                    // 연결 실패는 조용히 처리
-                }
+                string farmInfoJson = GetSensorDataJson();
+                flaskApi.SendFarmChange(farmInfoJson);
             });
         }
 
@@ -1888,14 +1429,14 @@ namespace SmartFarmUI
             {
                 logForm = new LogForm
                 {
-                    GetLogs = () => logHistory,
+                    GetLogs = () => logService.LogHistory,
                     SetLogs = (logs) =>
                     {
-                        logHistory.Clear();
-                        logHistory.AddRange(logs);
+                        logService.ClearLogs();
+                        foreach (var l in logs) logService.Log(l);
                         UpdateLogPreview();
                         if (logForm != null && !logForm.IsDisposed)
-                            logForm.UpdateLogs(logHistory);
+                            logForm.UpdateLogs(logService.LogHistory);
                     },
                     Log = (msg) => Log(msg)
                 };
@@ -1979,115 +1520,52 @@ namespace SmartFarmUI
         // Flask 서버 연결 확인
         private bool CheckFlaskServerConnection()
         {
-            try
-            {
-                var request = (HttpWebRequest)WebRequest.Create($"{FlaskServerUrl}/api/sensors");
-                request.Timeout = 3000; // 3초 타임아웃
-                request.Method = "GET";
-                
-                using (var response = (HttpWebResponse)request.GetResponse())
-                using (var stream = response.GetResponseStream())
-                using (var reader = new StreamReader(stream))
-                {
-                    string responseText = reader.ReadToEnd();
-                    flaskServerRunning = !string.IsNullOrEmpty(responseText);
-                    return flaskServerRunning;
-                }
-            }
-            catch
-            {
-                flaskServerRunning = false;
-                return false;
-            }
+            return flaskApi.CheckConnection();
         }
         
-        // Flask 서버로 센서 데이터 전송
         private void SendSensorDataToFlask()
         {
             if (!flaskServerRunning) return;
-            
+
             Task.Run(() =>
             {
-                try
-                {
-                    string sensorDataJson = GetSensorDataJson();
-                    
-                    var request = (HttpWebRequest)WebRequest.Create($"{FlaskServerUrl}/api/sensor-data");
-                    request.Timeout = 2000; // 2초 타임아웃
-                    request.Method = "POST";
-                    request.ContentType = "application/json";
-                    
-                    byte[] dataBytes = Encoding.UTF8.GetBytes(sensorDataJson);
-                    request.ContentLength = dataBytes.Length;
-                    
-                    using (var requestStream = request.GetRequestStream())
-                    {
-                        requestStream.Write(dataBytes, 0, dataBytes.Length);
-                    }
-                    
-                    using (var response = (HttpWebResponse)request.GetResponse())
-                    {
-                        // 성공적으로 전송됨 (로그는 필요시에만)
-                        // Log("센서 데이터 전송 완료");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    // 연결 실패는 조용히 처리 (서버가 꺼져있을 수 있음)
-                    // 첫 번째 실패만 로그 기록 (너무 많은 로그 방지)
-                    if (flaskServerRunning)
-                    {
-                        System.Diagnostics.Debug.WriteLine($"⚠️ 센서 데이터 전송 실패: {ex.Message}");
-                        // Log는 주석 처리 (너무 많은 로그 방지)
-                        // Log($"⚠️ Flask 서버로 센서 데이터 전송 실패: {ex.Message}");
-                    }
-                    flaskServerRunning = false;
-                }
+                string sensorDataJson = GetSensorDataJson();
+                flaskApi.SendSensorData(sensorDataJson);
             });
         }
 
         private void Log(string message)
         {
-            string time = DateTime.Now.ToString("HH:mm:ss");
-            string logEntry = $"[{time}] {message}";
-            logHistory.Add(logEntry);
-            UpdateLogPreview();
-            if (logForm != null && !logForm.IsDisposed)
-            {
-                logForm.UpdateLogs(logHistory);
-            }
+            logService.Log(message);
         }
 
         private void LogWarning(string message)
         {
-            Log($"⚠️ {message}");
+            logService.LogWarning(message);
         }
-        
-        // 웹 표준 형식: 4개 센서 데이터를 한 번에 로깅
+
         private void LogSensorData(string status = "정상")
         {
             if (!powerOn || !adsConnected) return;
-            
+
             lock (sensorDataLock)
             {
-                string time = DateTime.Now.ToString("HH:mm:ss");
-                string statusIcon = status == "정상" ? "✅" : "⚠️";
-                
-                // 웹에서 파싱하기 쉬운 형식: [HH:mm:ss] 센서데이터 습도:값% 온도:값℃ 채광:값% 토양습도:값% 상태:상태
-                string logEntry = $"[{time}] {statusIcon} 센서데이터 " +
-                                 $"습도:{currentSensorData.Humidity:F1}% " +
-                                 $"온도:{currentSensorData.Temperature:F1}℃ " +
-                                 $"채광:{currentSensorData.Light:F1}% " +
-                                 $"토양습도:{currentSensorData.SoilMoisture:F1}% " +
-                                 $"상태:{status}";
-                
-                logHistory.Add(logEntry);
+                logService.LogSensorData(currentSensorData, status);
                 lastSensorLogTime = DateTime.Now;
-                UpdateLogPreview();
-                if (logForm != null && !logForm.IsDisposed)
-                {
-                    logForm.UpdateLogs(logHistory);
-                }
+            }
+        }
+
+        private void OnLogEntryAdded(string entry)
+        {
+            if (InvokeRequired)
+            {
+                BeginInvoke(new Action(() => OnLogEntryAdded(entry)));
+                return;
+            }
+            UpdateLogPreview();
+            if (logForm != null && !logForm.IsDisposed)
+            {
+                logForm.UpdateLogs(logService.LogHistory);
             }
         }
         
@@ -2137,7 +1615,7 @@ namespace SmartFarmUI
 
         private string[] GetLogEntries()
         {
-            return logHistory.ToArray();
+            return logService.GetLogEntries();
         }
 
         private void UpdateLogPreview()
@@ -2145,10 +1623,11 @@ namespace SmartFarmUI
             lstLogPreview.BeginUpdate();
             lstLogPreview.Items.Clear();
 
-            int startIndex = Math.Max(0, logHistory.Count - 10);
-            for (int i = logHistory.Count - 1; i >= startIndex; i--)
+            var logs = logService.LogHistory;
+            int startIndex = Math.Max(0, logs.Count - 10);
+            for (int i = logs.Count - 1; i >= startIndex; i--)
             {
-                lstLogPreview.Items.Add(logHistory[i]);
+                lstLogPreview.Items.Add(logs[i]);
             }
 
             lstLogPreview.EndUpdate();
@@ -2426,7 +1905,7 @@ namespace SmartFarmUI
                     // Flask 서버 연결 상태 확인 (비동기)
                     if (!flaskServerRunning)
                     {
-                        flaskServerRunning = CheckFlaskServerConnection();
+                        CheckFlaskServerConnection();
                     }
                     
                     // 작물이 선택되었고, Flask 서버에 연결되어 있으면 작물 정보 자동 설정
@@ -2547,207 +2026,40 @@ namespace SmartFarmUI
 
             try
             {
-                adsClient = new TcAdsClient();
-                adsClient.Connect(AdsPort);
-                adsAnalogHandle = adsClient.CreateVariableHandle(AnalogInputSymbol);
-                
-                // 디지털 입력 핸들 생성 (GVL 포함/미포함 모두 시도)
-                string[] inputSymbols = { DigitalInputSymbol, "NX_ID5342" };
-                foreach (string symbol in inputSymbols)
-                {
-                    try
-                    {
-                        adsDigitalInputHandle = adsClient.CreateVariableHandle(symbol);
-                        Log($"디지털 입력 핸들 생성 성공: {symbol}");
-                        break;
-                    }
-                    catch (Exception ex)
-                    {
-                        if (symbol == inputSymbols[inputSymbols.Length - 1])
-                        {
-                            Log($"⚠️ 디지털 입력 핸들 생성 실패: {ex.Message} (버튼 기능 비활성화)");
-                        }
-                    }
-                }
-                
-                // 디지털 출력 핸들 생성 (GVL 포함/미포함 모두 시도)
-                string[] outputSymbols = { DigitalOutputSymbol, "NX_OD5121" };
-                foreach (string symbol in outputSymbols)
-                {
-                    try
-                    {
-                        adsDigitalOutputHandle = adsClient.CreateVariableHandle(symbol);
-                        Log($"디지털 출력 핸들 생성 성공: {symbol}");
-                        
-                        // 개별 램프 핸들도 생성 시도
-                        try
-                        {
-                            string baseSymbol = symbol.Contains(".") ? symbol.Substring(0, symbol.LastIndexOf('.')) : "";
-                            if (!string.IsNullOrEmpty(baseSymbol))
-                            {
-                                adsLampHandles[1] = adsClient.CreateVariableHandle($"{baseSymbol}.Lamp1");
-                                adsLampHandles[2] = adsClient.CreateVariableHandle($"{baseSymbol}.Lamp2");
-                                adsLampHandles[3] = adsClient.CreateVariableHandle($"{baseSymbol}.Lamp3");
-                                adsLampHandles[4] = adsClient.CreateVariableHandle($"{baseSymbol}.Lamp4");
-                                Log("개별 램프 핸들 생성 성공");
-                            }
-                        }
-                        catch
-                        {
-                            // 개별 핸들 생성 실패는 무시 (구조체로 시도)
-                        }
-                        break;
-                    }
-                    catch (Exception ex)
-                    {
-                        if (symbol == outputSymbols[outputSymbols.Length - 1])
-                        {
-                            Log($"⚠️ 디지털 출력 핸들 생성 실패: {ex.Message} (램프 기능 비활성화)");
-                        }
-                    }
-                }
-
-                adsPollTimer = new System.Threading.Timer(PollPlcValues, null, TimeSpan.Zero, TimeSpan.FromMilliseconds(1000));
+                bool result = plcService.Connect(msg => Log(msg));
                 adsConnected = true;
-                
-                // 센서 초기화 시간 기록 (초기 연결 후 일정 시간 동안 경고 표시 안 함)
+
                 sensorInitializationTime = DateTime.Now;
-                
-                // 센서 알림 상태 초기화 (초기 연결 시 경고 방지)
                 ResetSensorAlerts();
-                
-                // 정기 센서 데이터 로깅 타이머 시작 (웹 표준 형식)
+
                 sensorLogTimer?.Dispose();
                 sensorLogTimer = new System.Threading.Timer(SensorLogTimerCallback, null, sensorLogInterval, sensorLogInterval);
                 lastSensorLogTime = DateTime.Now;
-                
-                Log("PLC 연결 성공");
-                return true;
+
+                return result;
             }
             catch (Exception ex)
             {
                 DisconnectFromPlc(false);
-                MessageBox.Show($"PLC 연결 실패: {ex.Message}", "PLC 연결 오류", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                Log($"PLC 연결 실패: {ex.Message}");
+                MessageBox.Show(ex.Message, "PLC 연결 오류", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                Log(ex.Message);
                 return false;
             }
         }
 
         private void DisconnectFromPlc(bool log = true)
         {
-            lock (adsLock)
-            {
-                adsPollTimer?.Dispose();
-                adsPollTimer = null;
-                
-                // 정기 센서 데이터 로깅 타이머 정리
-                sensorLogTimer?.Dispose();
-                sensorLogTimer = null;
+            sensorLogTimer?.Dispose();
+            sensorLogTimer = null;
+            sensorInitializationTime = DateTime.MinValue;
+            ResetSensorAlerts();
 
-                // 연결 해제 시 센서 초기화 시간 리셋
-                sensorInitializationTime = DateTime.MinValue;
-                
-                // 센서 알림 상태 초기화
-                ResetSensorAlerts();
-
-                if (adsClient != null)
-                {
-                    try
-                    {
-                        if (adsAnalogHandle != -1)
-                        {
-                            adsClient.DeleteVariableHandle(adsAnalogHandle);
-                            adsAnalogHandle = -1;
-                        }
-                        if (adsDigitalInputHandle != -1)
-                        {
-                            adsClient.DeleteVariableHandle(adsDigitalInputHandle);
-                            adsDigitalInputHandle = -1;
-                        }
-                        if (adsDigitalOutputHandle != -1)
-                        {
-                            adsClient.DeleteVariableHandle(adsDigitalOutputHandle);
-                            adsDigitalOutputHandle = -1;
-                        }
-                        for (int i = 1; i <= 4; i++)
-                        {
-                            if (adsLampHandles[i] != -1)
-                            {
-                                try
-                                {
-                                    adsClient.DeleteVariableHandle(adsLampHandles[i]);
-                                }
-                                catch { }
-                                adsLampHandles[i] = -1;
-                            }
-                        }
-                        adsClient.Dispose();
-                    }
-                    catch
-                    {
-                        // ignore cleanup errors
-                    }
-                    finally
-                    {
-                        adsClient = null;
-                    }
-                }
-
-                adsConnected = false;
-                buttonStatesInitialized = false; // 버튼 상태 초기화 플래그 리셋
-            }
-
-            if (log)
-            {
-                Log("PLC 연결 해제");
-            }
+            plcService.Disconnect(log, msg => Log(msg));
+            adsConnected = false;
+            buttonStatesInitialized = false;
         }
 
-        private void PollPlcValues(object state)
-        {
-            lock (adsLock)
-            {
-                if (adsClient == null || !adsConnected || adsAnalogHandle == -1)
-                    return;
-
-                try
-                {
-#pragma warning disable CA1031
-                    // 아날로그 입력 읽기
-                    var analogData = (AnalogInputData)adsClient.ReadAny(adsAnalogHandle, typeof(AnalogInputData));
-                    UpdateSensorsFromPlc(analogData);
-
-                    // 디지털 입력 읽기 (버튼)
-                    if (adsDigitalInputHandle != -1)
-                    {
-                        try
-                        {
-                            // 구조체로 직접 읽기 (ushort = 2바이트)
-                            var digitalInput = (DigitalInputData)adsClient.ReadAny(adsDigitalInputHandle, typeof(DigitalInputData));
-                            HandleDigitalInput(digitalInput);
-                        }
-                        catch
-                        {
-                            // 디지털 입력 읽기 실패는 조용히 처리 (로그만 기록)
-                            // Log($"디지털 입력 읽기 실패: {ex.Message}"); // 너무 많이 출력되지 않도록 주석 처리
-                        }
-                    }
-#pragma warning restore CA1031
-                }
-                catch (Exception ex)
-                {
-                    adsConnected = false;
-                    BeginInvoke(new Action(() =>
-                    {
-                        Log($"PLC 데이터 읽기 실패: {ex.Message}");
-                        MessageBox.Show($"PLC 데이터 읽기 실패: {ex.Message}", "PLC 오류", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                        DisconnectFromPlc(false);
-                        ethercatPowerOn = false;
-                        SetEthercatStatus(EthercatConnectionStatus.Error);
-                    }));
-                }
-            }
-        }
+        // PollPlcValues moved to PlcService - events handled via plcService.AnalogDataReceived/DigitalInputReceived/ConnectionError
 
         private void UpdateSensorsFromPlc(AnalogInputData data)
         {
@@ -3186,34 +2498,11 @@ namespace SmartFarmUI
             }
         }
 
-        private static int ClampToProgress(double value)
-        {
-            return (int)Math.Round(Clamp(value, 0, 100));
-        }
-
-        private static double Clamp(double value, double min, double max)
-        {
-            if (value < min) return min;
-            if (value > max) return max;
-            return value;
-        }
-
-        private static double ScaleLinear(double raw, double rawMin, double rawMax, double valueMin, double valueMax)
-        {
-            if (Math.Abs(rawMax - rawMin) < double.Epsilon)
-                return valueMin;
-
-            double ratio = (raw - rawMin) / (rawMax - rawMin);
-            return valueMin + ratio * (valueMax - valueMin);
-        }
-
-        private static double ConvertTemperatureCelsius(int raw)
-        {
-            // 추정: 4610 -> 26℃, 5000 -> 30℃
-            const double slope = 0.010256; // ℃ per raw unit
-            const double intercept = -21.0;
-            return slope * raw + intercept;
-        }
+        // ClampToProgress, Clamp, ScaleLinear, ConvertTemperatureCelsius moved to Services/SensorCalibration.cs
+        private static int ClampToProgress(double value) => SensorCalibration.ClampToProgress(value);
+        private static double Clamp(double value, double min, double max) => SensorCalibration.Clamp(value, min, max);
+        private static double ScaleLinear(double raw, double rawMin, double rawMax, double valueMin, double valueMax) => SensorCalibration.ScaleLinear(raw, rawMin, rawMax, valueMin, valueMax);
+        private static double ConvertTemperatureCelsius(int raw) => SensorCalibration.ConvertTemperatureCelsius(raw);
 
         private void HandleEditSensorValue(int index)
         {
@@ -3440,150 +2729,55 @@ namespace SmartFarmUI
 
         private void UpdateDigitalOutputs()
         {
-            if (adsClient == null || !adsConnected || adsDigitalOutputHandle == -1)
+            if (!plcService.IsConnected)
                 return;
 
             try
             {
                 DigitalOutputData output = new DigitalOutputData();
-                output.Bits = 0; // 초기화
+                output.Bits = 0;
 
-                // 램프 1: 전원 상태 ON/OFF (비트 0)
                 if (powerOn)
                     output.Bits |= (ushort)(1 << 0);
 
-                // 램프 2: 센서값이 조건값보다 낮을 경우 점등 (비트 1)
                 bool anyLow = false;
                 for (int i = 1; i <= SensorCount; i++)
                 {
-                    if (sensorAlertStates[i] == -1)
-                    {
-                        anyLow = true;
-                        break;
-                    }
+                    if (sensorAlertStates[i] == -1) { anyLow = true; break; }
                 }
                 if (anyLow)
                     output.Bits |= (ushort)(1 << 1);
 
-                // 램프 3: 센서값이 조건값보다 높을 경우 점등 (비트 2)
                 bool anyHigh = false;
                 for (int i = 1; i <= SensorCount; i++)
                 {
-                    if (sensorAlertStates[i] == 1)
-                    {
-                        anyHigh = true;
-                        break;
-                    }
+                    if (sensorAlertStates[i] == 1) { anyHigh = true; break; }
                 }
                 if (anyHigh)
                     output.Bits |= (ushort)(1 << 2);
 
-                // 램프 4: 모든 조건을 만족했을 경우 점등 (비트 3)
                 bool allNormal = true;
                 for (int i = 1; i <= SensorCount; i++)
                 {
-                    if (sensorAlertStates[i] != 0)
-                    {
-                        allNormal = false;
-                        break;
-                    }
+                    if (sensorAlertStates[i] != 0) { allNormal = false; break; }
                 }
                 if (allNormal && powerOn)
                     output.Bits |= (ushort)(1 << 3);
 
-                lock (adsLock)
-                {
-                    if (adsClient != null && adsConnected && adsDigitalOutputHandle != -1)
-                    {
-                        // WriteAny로 구조체 직접 쓰기 (ushort = 2바이트)
-                        adsClient.WriteAny(adsDigitalOutputHandle, output);
-                    }
-                }
+                plcService.WriteDigitalOutput(output);
             }
             catch (Exception ex)
             {
-                // 램프 출력 실패는 조용히 처리 (로그만 기록)
                 Log($"램프 출력 실패: {ex.Message}");
             }
         }
 
-        [StructLayout(LayoutKind.Sequential, Pack = 1)]
-        private struct AnalogInputData
-        {
-            public short Pressure_Sensor;
-            public short Vibration_Sensor;
-            public short Temperature_Sensor;
-            public short Humidity_Sensor;
-            public short Reserve4;
-            public short Reserve5;
-            public short Reserve6;
-            public short Reserve7;
-        }
-
-        // TwinCAT에서 BIT 타입은 ushort(2바이트)로 패킹됨
-        // 16개의 BIT = 2바이트 (16비트)
-        [StructLayout(LayoutKind.Sequential, Pack = 1)]
-        private struct DigitalInputData
-        {
-            public ushort Bits; // 비트 0: Button1, 비트 1: Button2, 비트 2: Button3, 비트 3: Button4, ...
-        }
-
-        [StructLayout(LayoutKind.Sequential, Pack = 1)]
-        private struct DigitalOutputData
-        {
-            public ushort Bits; // 비트 0: Lamp1, 비트 1: Lamp2, 비트 2: Lamp3, 비트 3: Lamp4, ...
-        }
+        // AnalogInputData, DigitalInputData, DigitalOutputData moved to Models/PlcDataStructs.cs
 
         // 웹 서버용 JSON 데이터 생성 메서드
         private string GetLogsJson()
         {
-            // AI 분석에 필요한 로그만 필터링 (센서 관련, 오류, 경고, 상태 변경 등)
-            var aiRelevantLogs = logHistory.Where(log =>
-            {
-                if (string.IsNullOrWhiteSpace(log)) return false;
-                
-                // 제외할 로그 (UI 관련, 불필요한 정보)
-                if (log.Contains("스마트팜") && (log.Contains("선택") || log.Contains("번 선택")))
-                    return false;
-                if (log.Contains("로그 저장 완료") || log.Contains("로그 저장 실패"))
-                    return false;
-                if (log.Contains("로그 불러오기 완료") || log.Contains("로그 불러오기 실패"))
-                    return false;
-                if (log.Contains("로그 추가 완료") || log.Contains("로그 추가 실패"))
-                    return false;
-                if (log.Contains("로그가 모두 지워졌습니다"))
-                    return false;
-                if (log.Contains("웹서버:") && (log.Contains("웹 서버 시작") || log.Contains("웹 서버 중지")))
-                    return false;
-                
-                // 포함할 로그 (AI 분석에 필요한 정보)
-                return log.Contains("센서") ||
-                       log.Contains("습도") ||
-                       log.Contains("온도") ||
-                       log.Contains("채광") ||
-                       log.Contains("토양") ||
-                       log.Contains("⚠️") ||
-                       log.Contains("오류") ||
-                       log.Contains("에러") ||
-                       log.Contains("경고") ||
-                       log.Contains("주의") ||
-                       log.Contains("정상 복귀") ||
-                       log.Contains("✅") ||
-                       log.Contains("전원") && (log.Contains("켜짐") || log.Contains("꺼짐") || log.Contains("OFF") || log.Contains("ON")) ||
-                       log.Contains("연결") && (log.Contains("연결됨") || log.Contains("연결 실패") || log.Contains("연결 안됨")) ||
-                       log.Contains("EtherCAT") ||
-                       log.Contains("Error") ||
-                       log.Contains("Warning") ||
-                       log.Contains("재배 작물") ||
-                       log.Contains("정보:");
-            }).Select(log => new
-            {
-                timestamp = log.Length > 10 ? log.Substring(1, 8) : DateTime.Now.ToString("HH:mm:ss"),
-                message = log.Length > 11 ? log.Substring(11) : log,
-                date = DateTime.Now.ToString("yyyy-MM-dd")
-            }).Take(500).ToList(); // AI 분석을 위해 더 많은 로그 제공
-
-            return ToJson(aiRelevantLogs);
+            return logService.GetLogsJson();
         }
 
         private string GetSensorDataJson()
@@ -3724,352 +2918,32 @@ namespace SmartFarmUI
         // 간단한 JSON 변환 메서드
         private string ToJson(object obj)
         {
-            if (obj == null) return "null";
-            
-            if (obj is string str) return "\"" + EscapeJson(str) + "\"";
-            if (obj is bool b) return b ? "true" : "false";
-            if (obj is int || obj is long || obj is double || obj is float || obj is decimal)
-                return obj.ToString();
-            
-            if (obj is System.Collections.IEnumerable enumerable && !(obj is string))
-            {
-                var items = enumerable.Cast<object>().Select(ToJson);
-                return "[" + string.Join(",", items) + "]";
-            }
-
-            var properties = obj.GetType().GetProperties();
-            var jsonParts = new List<string>();
-            
-            foreach (var prop in properties)
-            {
-                var value = prop.GetValue(obj);
-                var jsonValue = ToJson(value);
-                jsonParts.Add($"\"{prop.Name}\":{jsonValue}");
-            }
-            
-            return "{" + string.Join(",", jsonParts) + "}";
+            return JsonHelper.ToJson(obj);
         }
 
         private string EscapeJson(string str)
         {
-            if (string.IsNullOrEmpty(str)) return "";
-            return str.Replace("\\", "\\\\")
-                      .Replace("\"", "\\\"")
-                      .Replace("\n", "\\n")
-                      .Replace("\r", "\\r")
-                      .Replace("\t", "\\t");
+            return JsonHelper.EscapeJson(str);
         }
 
-        // 로그 파일 저장 메서드 (웹 서버용)
         private bool SaveLogsToFile(string requestBody)
         {
-            try
-            {
-                // 간단한 JSON 파싱: {"filePath": "...", "logs": [...]}
-                // 또는 단순히 파일 경로만 전달될 수도 있음
-                string filePath = "";
-                List<string> logsToSave = new List<string>();
-
-                // JSON 형식인지 확인
-                if (requestBody.Trim().StartsWith("{"))
-                {
-                    // JSON 파싱 시도
-                    int filePathStart = requestBody.IndexOf("\"filePath\"");
-                    if (filePathStart >= 0)
-                    {
-                        int colonIndex = requestBody.IndexOf(":", filePathStart);
-                        int quoteStart = requestBody.IndexOf("\"", colonIndex) + 1;
-                        int quoteEnd = requestBody.IndexOf("\"", quoteStart);
-                        if (quoteEnd > quoteStart)
-                        {
-                            filePath = requestBody.Substring(quoteStart, quoteEnd - quoteStart);
-                        }
-                    }
-
-                    // logs 배열 파싱
-                    int logsStart = requestBody.IndexOf("\"logs\"");
-                    if (logsStart >= 0)
-                    {
-                        int arrayStart = requestBody.IndexOf("[", logsStart);
-                        if (arrayStart >= 0)
-                        {
-                            // 간단한 파싱 - 실제로는 JSON 라이브러리 사용 권장
-                            // 여기서는 전체 로그를 저장
-                            logsToSave = logHistory.ToList();
-                        }
-                    }
-                }
-                else
-                {
-                    // 단순 파일 경로만 전달된 경우
-                    filePath = requestBody.Trim().Trim('"', '\'', ' ');
-                    logsToSave = logHistory.ToList();
-                }
-
-                if (string.IsNullOrEmpty(filePath))
-                {
-                    // 파일 경로가 없으면 기본 경로 사용
-                    string defaultDir = Path.Combine(Application.StartupPath, "Logs");
-                    if (!Directory.Exists(defaultDir))
-                        Directory.CreateDirectory(defaultDir);
-                    filePath = Path.Combine(defaultDir, $"SmartFarm_Logs_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
-                }
-
-                // 파일 저장
-                System.IO.File.WriteAllLines(filePath, logsToSave, System.Text.Encoding.UTF8);
-                Log($"로그 파일 저장 완료: {filePath} ({logsToSave.Count}개 항목)");
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Log($"로그 파일 저장 실패: {ex.Message}");
-                return false;
-            }
+            return logService.SaveLogsToFile(requestBody);
         }
 
-        // 로그 파일 불러오기 메서드 (웹 서버용 - 서버 측 파일 경로)
         private string LoadLogsFromFile(string filePath)
         {
-            try
-            {
-                if (string.IsNullOrEmpty(filePath) || !System.IO.File.Exists(filePath))
-                {
-                    return "{\"error\":\"파일을 찾을 수 없습니다.\"}";
-                }
-
-                var loadedLogs = System.IO.File.ReadAllLines(filePath, System.Text.Encoding.UTF8).ToList();
-                
-                // AI 분석에 필요한 로그만 필터링
-                var filteredLogs = loadedLogs.Where(log =>
-                {
-                    if (string.IsNullOrWhiteSpace(log)) return false;
-                    
-                    // 제외할 로그 (UI 관련, 불필요한 정보)
-                    if (log.Contains("스마트팜") && (log.Contains("선택") || log.Contains("번 선택")))
-                        return false;
-                    if (log.Contains("로그 저장 완료") || log.Contains("로그 저장 실패"))
-                        return false;
-                    if (log.Contains("로그 불러오기 완료") || log.Contains("로그 불러오기 실패"))
-                        return false;
-                    if (log.Contains("로그 추가 완료") || log.Contains("로그 추가 실패"))
-                        return false;
-                    if (log.Contains("로그가 모두 지워졌습니다"))
-                        return false;
-                    if (log.Contains("웹서버:") && (log.Contains("웹 서버 시작") || log.Contains("웹 서버 중지")))
-                        return false;
-                    
-                    // 포함할 로그 (AI 분석에 필요한 정보)
-                    return log.Contains("센서") ||
-                           log.Contains("습도") ||
-                           log.Contains("온도") ||
-                           log.Contains("채광") ||
-                           log.Contains("토양") ||
-                           log.Contains("⚠️") ||
-                           log.Contains("오류") ||
-                           log.Contains("에러") ||
-                           log.Contains("경고") ||
-                           log.Contains("주의") ||
-                           log.Contains("전원") && (log.Contains("켜짐") || log.Contains("꺼짐") || log.Contains("OFF") || log.Contains("ON")) ||
-                           log.Contains("연결") && (log.Contains("연결됨") || log.Contains("연결 실패") || log.Contains("연결 안됨")) ||
-                           log.Contains("EtherCAT") ||
-                           log.Contains("Error") ||
-                           log.Contains("Warning") ||
-                           log.Contains("재배 작물") ||
-                           log.Contains("정보:");
-                }).ToList();
-                
-                // JSON 형식으로 변환
-                var logsJson = filteredLogs.Select(log => new
-                {
-                    timestamp = log.Length > 10 ? log.Substring(1, 8) : DateTime.Now.ToString("HH:mm:ss"),
-                    message = log.Length > 11 ? log.Substring(11) : log,
-                    date = DateTime.Now.ToString("yyyy-MM-dd")
-                }).Take(500).ToList();
-
-                return ToJson(logsJson);
-            }
-            catch (Exception ex)
-            {
-                Log($"로그 파일 불러오기 실패: {ex.Message}");
-                return $"{{\"error\":\"{EscapeJson(ex.Message)}\"}}";
-            }
+            return logService.LoadLogsFromFile(filePath);
         }
 
-        // 로그 파일 내용 파싱 메서드 (웹 서버용 - 클라이언트에서 전송한 파일 내용)
         private string ParseLogsFromContent(string fileContent)
         {
-            try
-            {
-                if (string.IsNullOrEmpty(fileContent))
-                {
-                    return "[]";
-                }
-
-                // 파일 내용을 줄 단위로 분리
-                var allLines = fileContent.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None)
-                    .Where(line => !string.IsNullOrWhiteSpace(line))
-                    .ToList();
-
-                // AI 분석에 필요한 로그만 필터링
-                var filteredLines = allLines.Where(log =>
-                {
-                    if (string.IsNullOrWhiteSpace(log)) return false;
-                    
-                    // 제외할 로그 (UI 관련, 불필요한 정보)
-                    if (log.Contains("스마트팜") && (log.Contains("선택") || log.Contains("번 선택")))
-                        return false;
-                    if (log.Contains("로그 저장 완료") || log.Contains("로그 저장 실패"))
-                        return false;
-                    if (log.Contains("로그 불러오기 완료") || log.Contains("로그 불러오기 실패"))
-                        return false;
-                    if (log.Contains("로그 추가 완료") || log.Contains("로그 추가 실패"))
-                        return false;
-                    if (log.Contains("로그가 모두 지워졌습니다"))
-                        return false;
-                    if (log.Contains("웹서버:") && (log.Contains("웹 서버 시작") || log.Contains("웹 서버 중지")))
-                        return false;
-                    
-                    // 포함할 로그 (AI 분석에 필요한 정보)
-                    return log.Contains("센서") ||
-                           log.Contains("습도") ||
-                           log.Contains("온도") ||
-                           log.Contains("채광") ||
-                           log.Contains("토양") ||
-                           log.Contains("⚠️") ||
-                           log.Contains("오류") ||
-                           log.Contains("에러") ||
-                           log.Contains("경고") ||
-                           log.Contains("주의") ||
-                           log.Contains("전원") && (log.Contains("켜짐") || log.Contains("꺼짐") || log.Contains("OFF") || log.Contains("ON")) ||
-                           log.Contains("연결") && (log.Contains("연결됨") || log.Contains("연결 실패") || log.Contains("연결 안됨")) ||
-                           log.Contains("EtherCAT") ||
-                           log.Contains("Error") ||
-                           log.Contains("Warning") ||
-                           log.Contains("재배 작물") ||
-                           log.Contains("정보:");
-                }).ToList();
-
-                // JSON 형식으로 변환
-                var logsJson = filteredLines.Select(log => new
-                {
-                    timestamp = log.Length > 10 && log.StartsWith("[") ? log.Substring(1, 8) : DateTime.Now.ToString("HH:mm:ss"),
-                    message = log.Length > 11 && log.StartsWith("[") ? log.Substring(11).Trim() : log.Trim(),
-                    date = DateTime.Now.ToString("yyyy-MM-dd")
-                }).ToList();
-
-                return ToJson(logsJson);
-            }
-            catch (Exception ex)
-            {
-                Log($"로그 파일 내용 파싱 실패: {ex.Message}");
-                return $"{{\"error\":\"{EscapeJson(ex.Message)}\"}}";
-            }
+            return logService.ParseLogsFromContent(fileContent);
         }
 
-        // 로그 추가 메서드 (웹 서버용 - JSON 형식의 로그 배열을 현재 로그에 추가)
         private bool AddLogsToHistory(string logsJson)
         {
-            try
-            {
-                if (string.IsNullOrEmpty(logsJson))
-                {
-                    return false;
-                }
-
-                // 간단한 JSON 파싱 (실제로는 JSON 라이브러리 사용 권장)
-                // JSON 배열에서 로그 항목 추출
-                var lines = new List<string>();
-                
-                // JSON 배열 파싱 시도
-                int startIndex = logsJson.IndexOf('[');
-                int endIndex = logsJson.LastIndexOf(']');
-                if (startIndex >= 0 && endIndex > startIndex)
-                {
-                    string arrayContent = logsJson.Substring(startIndex + 1, endIndex - startIndex - 1);
-                    
-                    // 각 객체 추출
-                    int braceCount = 0;
-                    int objStart = -1;
-                    for (int i = 0; i < arrayContent.Length; i++)
-                    {
-                        if (arrayContent[i] == '{')
-                        {
-                            if (braceCount == 0) objStart = i;
-                            braceCount++;
-                        }
-                        else if (arrayContent[i] == '}')
-                        {
-                            braceCount--;
-                            if (braceCount == 0 && objStart >= 0)
-                            {
-                                string objStr = arrayContent.Substring(objStart, i - objStart + 1);
-                                
-                                // timestamp와 message 추출
-                                string timestamp = "";
-                                string message = "";
-                                
-                                int timestampIndex = objStr.IndexOf("\"timestamp\"");
-                                if (timestampIndex >= 0)
-                                {
-                                    int colonIndex = objStr.IndexOf(":", timestampIndex);
-                                    int quoteStart = objStr.IndexOf("\"", colonIndex) + 1;
-                                    int quoteEnd = objStr.IndexOf("\"", quoteStart);
-                                    if (quoteEnd > quoteStart)
-                                    {
-                                        timestamp = objStr.Substring(quoteStart, quoteEnd - quoteStart);
-                                    }
-                                }
-                                
-                                int messageIndex = objStr.IndexOf("\"message\"");
-                                if (messageIndex >= 0)
-                                {
-                                    int colonIndex = objStr.IndexOf(":", messageIndex);
-                                    int quoteStart = objStr.IndexOf("\"", colonIndex) + 1;
-                                    int quoteEnd = objStr.IndexOf("\"", quoteStart);
-                                    if (quoteEnd > quoteStart)
-                                    {
-                                        message = objStr.Substring(quoteStart, quoteEnd - quoteStart);
-                                    }
-                                }
-                                
-                                if (!string.IsNullOrEmpty(message))
-                                {
-                                    string logEntry = $"[{timestamp}] {message}";
-                                    lines.Add(logEntry);
-                                }
-                                
-                                objStart = -1;
-                            }
-                        }
-                    }
-                }
-
-                // 기존 로그에 추가
-                lock (logHistory)
-                {
-                    foreach (var line in lines)
-                    {
-                        if (!logHistory.Contains(line)) // 중복 방지
-                        {
-                            logHistory.Add(line);
-                        }
-                    }
-                }
-
-                UpdateLogPreview();
-                if (logForm != null && !logForm.IsDisposed)
-                {
-                    logForm.UpdateLogs(logHistory);
-                }
-
-                Log($"로그 추가 완료: {lines.Count}개 항목 추가");
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Log($"로그 추가 실패: {ex.Message}");
-                return false;
-            }
+            return logService.AddLogsToHistory(logsJson);
         }
 
     }
