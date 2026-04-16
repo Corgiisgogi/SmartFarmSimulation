@@ -274,17 +274,13 @@
                 <!-- Lamp Control -->
                 <GroupBox Header="램프 제어" Style="{StaticResource GroupBoxStyle}">
                     <UniformGrid Rows="2" Columns="2">
-                        <ToggleButton Content="💡 램프1" IsChecked="{Binding LampStates[0]}"
-                                      Command="{Binding ToggleLampCommand}" CommandParameter="1"
+                        <ToggleButton Content="💡 램프1" IsChecked="{Binding Lamp1On, Mode=TwoWay}"
                                       Style="{StaticResource LampBtn}"/>
-                        <ToggleButton Content="💡 램프2" IsChecked="{Binding LampStates[1]}"
-                                      Command="{Binding ToggleLampCommand}" CommandParameter="2"
+                        <ToggleButton Content="💡 램프2" IsChecked="{Binding Lamp2On, Mode=TwoWay}"
                                       Style="{StaticResource LampBtn}"/>
-                        <ToggleButton Content="💡 램프3" IsChecked="{Binding LampStates[2]}"
-                                      Command="{Binding ToggleLampCommand}" CommandParameter="3"
+                        <ToggleButton Content="💡 램프3" IsChecked="{Binding Lamp3On, Mode=TwoWay}"
                                       Style="{StaticResource LampBtn}"/>
-                        <ToggleButton Content="💡 램프4" IsChecked="{Binding LampStates[3]}"
-                                      Command="{Binding ToggleLampCommand}" CommandParameter="4"
+                        <ToggleButton Content="💡 램프4" IsChecked="{Binding Lamp4On, Mode=TwoWay}"
                                       Style="{StaticResource LampBtn}"/>
                     </UniformGrid>
                 </GroupBox>

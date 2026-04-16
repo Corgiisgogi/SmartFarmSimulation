@@ -46,10 +46,16 @@ namespace SmartFarmUI.Infrastructure
         public bool CanExecute(object parameter)
         {
             if (parameter == null && typeof(T).IsValueType) return false;
-            return _canExecute?.Invoke((T)parameter) ?? true;
+            return _canExecute?.Invoke(ConvertParameter(parameter)) ?? true;
         }
 
-        public void Execute(object parameter) => _execute((T)parameter);
+        public void Execute(object parameter) => _execute(ConvertParameter(parameter));
+
+        private static T ConvertParameter(object parameter)
+        {
+            if (parameter is T typed) return typed;
+            return (T)Convert.ChangeType(parameter, typeof(T));
+        }
 
         public event EventHandler CanExecuteChanged
         {
