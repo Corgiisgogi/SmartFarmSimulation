@@ -68,8 +68,34 @@ namespace SmartFarmUI.ViewModels
             { 1, new double[5] }, { 2, new double[5] }, { 3, new double[5] }
         };
 
-        // === Lamp States (index 0-3 = Lamp1-4) ===
-        public bool[] LampStates { get; } = new bool[4];
+        // === Lamp States ===
+        private bool _lamp1On;
+        public bool Lamp1On
+        {
+            get => _lamp1On;
+            set { if (SetField(ref _lamp1On, value)) WriteLampToPlc(1, value); }
+        }
+
+        private bool _lamp2On;
+        public bool Lamp2On
+        {
+            get => _lamp2On;
+            set { if (SetField(ref _lamp2On, value)) WriteLampToPlc(2, value); }
+        }
+
+        private bool _lamp3On;
+        public bool Lamp3On
+        {
+            get => _lamp3On;
+            set { if (SetField(ref _lamp3On, value)) WriteLampToPlc(3, value); }
+        }
+
+        private bool _lamp4On;
+        public bool Lamp4On
+        {
+            get => _lamp4On;
+            set { if (SetField(ref _lamp4On, value)) WriteLampToPlc(4, value); }
+        }
 
         // === Auto-Control ===
         private bool _autoControlEnabled;
@@ -248,16 +274,29 @@ namespace SmartFarmUI.ViewModels
         // === Lamp Control ===
         private void SetLamp(int index, bool on)
         {
-            if (index < 1 || index > 4) return;
-            LampStates[index - 1] = on;
-            OnPropertyChanged(nameof(LampStates));
-            try { _plcService.WriteLamp(index, on); } catch { }
+            switch (index)
+            {
+                case 1: Lamp1On = on; break;
+                case 2: Lamp2On = on; break;
+                case 3: Lamp3On = on; break;
+                case 4: Lamp4On = on; break;
+            }
         }
 
         private void ToggleLamp(int index)
         {
-            if (index < 1 || index > 4) return;
-            SetLamp(index, !LampStates[index - 1]);
+            switch (index)
+            {
+                case 1: Lamp1On = !_lamp1On; break;
+                case 2: Lamp2On = !_lamp2On; break;
+                case 3: Lamp3On = !_lamp3On; break;
+                case 4: Lamp4On = !_lamp4On; break;
+            }
+        }
+
+        private void WriteLampToPlc(int index, bool on)
+        {
+            try { _plcService.WriteLamp(index, on); } catch { }
         }
 
         // === Connection ===
